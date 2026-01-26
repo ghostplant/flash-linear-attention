@@ -157,9 +157,9 @@ class KimiDeltaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        recurrent_state: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
+        use_cache: bool | None = True,
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
@@ -176,16 +176,13 @@ class KimiDeltaAttention(nn.Module):
         if self.training:
             assert mode == "chunk", "Only chunk mode is supported in training."
 
-        last_state = None
-        if past_key_values is not None and len(past_key_values) > self.layer_idx:
-            last_state = past_key_values[self.layer_idx]
-
         cu_seqlens = kwargs.get("cu_seqlens")
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
         if self.use_short_conv:
+            assert False
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
@@ -226,7 +223,6 @@ class KimiDeltaAttention(nn.Module):
         if self.allow_neg_eigval:
             beta = beta * 2.0
 
-        recurrent_state = last_state["recurrent_state"] if last_state is not None else None
         if mode == "chunk":
             o, recurrent_state = chunk_kda(
                 q=q,
@@ -258,18 +254,10 @@ class KimiDeltaAttention(nn.Module):
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        if past_key_values is not None:
-            past_key_values.update(
-                recurrent_state=recurrent_state,
-                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
-                layer_idx=self.layer_idx,
-                offset=q_len,
-            )
-
         o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", d=self.head_v_dim))
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self.o_proj(o)
         if attention_mask is not None:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
-        return o, None, past_key_values
+        return o, recurrent_state
