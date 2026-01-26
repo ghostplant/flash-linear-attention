@@ -94,47 +94,11 @@ class KimiDeltaAttention(nn.Module):
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
         self.layer_idx = layer_idx
 
-        # Consistency check: Ensure expand_v produces integer values
-        if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
-            raise ValueError(
-                f"expand_v={expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
-                f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear.",
-            )
-        if self.num_v_heads > self.num_heads and self.num_v_heads % self.num_heads != 0:
-            raise ValueError(
-                f"num_v_heads={self.num_v_heads} must be divisible by num_heads={self.num_heads}.",
-            )
-
-        if not math.isclose(head_dim * expand_v, self.head_v_dim, rel_tol=1e-5):
-            raise ValueError(
-                f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
-                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
-            )
         assert mode in ["chunk", "fused_recurrent"], f"Not supported mode `{mode}`."
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-
-        if use_short_conv:
-            self.q_conv1d = ShortConvolution(
-                hidden_size=self.key_dim,
-                kernel_size=conv_size,
-                bias=conv_bias,
-                activation="silu",
-            )
-            self.k_conv1d = ShortConvolution(
-                hidden_size=self.key_dim,
-                kernel_size=conv_size,
-                bias=conv_bias,
-                activation="silu",
-            )
-            self.v_conv1d = ShortConvolution(
-                hidden_size=self.value_dim,
-                kernel_size=conv_size,
-                bias=conv_bias,
-                activation="silu",
-            )
 
         self.f_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
@@ -158,70 +122,28 @@ class KimiDeltaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         recurrent_state: torch.Tensor,
+        mode: str = 'fused_recurrent',
         attention_mask: torch.Tensor | None = None,
         use_cache: bool | None = True,
         output_attentions: bool | None = False,
         **kwargs: Unpack[dict],
     ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
-        if attention_mask is not None:
-            assert len(attention_mask.shape) == 2, (
-                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
-                "for padding purposes (0 indicating padding). "
-                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
-            )
 
         batch_size, q_len, _ = hidden_states.shape
-        # change to inference mode.
-        mode = "fused_recurrent" if (q_len <= 64 and not self.training) else self.mode
-        if self.training:
-            assert mode == "chunk", "Only chunk mode is supported in training."
+        q = F.silu(hidden_states @ self.q_proj.weight.t())  # bm,hkm->bhk
+        k = F.silu(hidden_states @ self.k_proj.weight.t())  # bm,hkm->bhk
+        v = F.silu(hidden_states @ self.v_proj.weight.t())  # bm,hkm->bhk
 
-        cu_seqlens = kwargs.get("cu_seqlens")
-        if attention_mask is not None:
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
-
-        if self.use_short_conv:
-            assert False
-            conv_state_q, conv_state_k, conv_state_v = None, None, None
-            if last_state is not None:
-                conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
-            q, conv_state_q = self.q_conv1d(
-                x=self.q_proj(hidden_states),
-                cache=conv_state_q,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
-            k, conv_state_k = self.k_conv1d(
-                x=self.k_proj(hidden_states),
-                cache=conv_state_k,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
-            v, conv_state_v = self.v_conv1d(
-                x=self.v_proj(hidden_states),
-                cache=conv_state_v,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
-        else:
-            q = F.silu(self.q_proj(hidden_states))
-            k = F.silu(self.k_proj(hidden_states))
-            v = F.silu(self.v_proj(hidden_states))
-
-        g = self.f_proj(hidden_states)
-        beta = self.b_proj(hidden_states).sigmoid()
+        g = hidden_states @ self.f_proj[0].weight.t() @ self.f_proj[1].weight.t()  # bs,lm->bl |  bl,hkl->bhk
+        beta = hidden_states @ self.b_proj.weight.t()  # bs,hs->bh
 
         q, k, g = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k, g))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
-        # for multi-value attention, we repeat the inputs for simplicity.
-        if self.num_v_heads > self.num_heads:
-            q, k, g = (repeat(x, "... h d -> ... (h g) d", g=self.num_v_heads // self.num_heads) for x in (q, k, g))
-            beta = repeat(beta, "... h -> ... (h g)", g=self.num_v_heads // self.num_heads)
-
         if self.allow_neg_eigval:
-            beta = beta * 2.0
+            beta = beta.sigmoid() * 2.0
+        else:
+            beta = beta.sigmoid()
 
         if mode == "chunk":
             o, recurrent_state = chunk_kda(
@@ -230,13 +152,12 @@ class KimiDeltaAttention(nn.Module):
                 v=v,
                 g=g,
                 beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
+                A_log=self.A_log,     # h
+                dt_bias=self.dt_bias, # hk
+                initial_state=recurrent_state, # B,H,K,V
                 output_final_state=use_cache,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                cu_seqlens=cu_seqlens,
             )
         elif mode == "fused_recurrent":
             g = fused_kda_gate(g=g, A_log=self.A_log, dt_bias=self.dt_bias)
@@ -246,18 +167,17 @@ class KimiDeltaAttention(nn.Module):
                 v=v,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,
+                initial_state=recurrent_state, # B,H,K,V
                 output_final_state=use_cache,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", d=self.head_v_dim))
+        factor = hidden_states @ self.g_proj[0].weight.t() @ self.g_proj[1].weight.t() + self.g_proj[1].bias[None, None, :]  # bs,lm->bl | bl,hkl->bhk | bhk + hk->bhk
+        factor = rearrange(factor, "... (h d) -> ... h d", d=self.head_v_dim)
+        o = self.o_norm(o, factor)
         o = rearrange(o, "b t h d -> b t (h d)")
-        o = self.o_proj(o)
-        if attention_mask is not None:
-            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
+        o = o @ self.o_proj.weight.t()  # bhk,mhk->bm
 
         return o, recurrent_state

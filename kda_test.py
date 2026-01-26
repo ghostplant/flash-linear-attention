@@ -18,4 +18,6 @@ with torch.no_grad():
   ).bfloat16().cuda()
   x = torch.randn([8, 1, 7168]).bfloat16().cuda()
   state_cache = torch.zeros([31, kda.num_heads, kda.head_dim, kda.head_v_dim], dtype=torch.float32, device='cuda')
-  print(kda(x, state_cache))
+  y, st = kda(x, state_cache)
+  print(y.flatten(), y.shape)
+  print(st.flatten(), st.shape)
