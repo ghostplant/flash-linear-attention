@@ -59,14 +59,6 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
-from .interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
-from .utils import (
-    PPMissingLayer,
-    is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
-    maybe_prefix,
-)
 
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops

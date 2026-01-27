@@ -65,13 +65,13 @@ class KimiDeltaAttention(nn.Module):
         num_heads: int = 16,
         num_v_heads: int = None,
         mode: str = "chunk",
-        use_short_conv: bool = True,
+        use_short_conv: bool = False,
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
-        **kwargs,
+        buffer_count: int = 32,
     ) -> KimiDeltaAttention:
         super().__init__()
 
@@ -110,6 +110,7 @@ class KimiDeltaAttention(nn.Module):
         self.A_log._no_weight_decay = True
         self.dt_bias = nn.Parameter(torch.zeros(self.key_dim, dtype=torch.float32))
         self.dt_bias._no_weight_decay = True
+        self.cache_states = torch.zeros([buffer_count, self.num_heads, self.head_dim, self.head_v_dim], dtype=torch.float32)
 
         self.g_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
@@ -121,7 +122,7 @@ class KimiDeltaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        recurrent_state: torch.Tensor,
+        recurrent_state: torch.Tensor = None,
         mode: str = 'fused_recurrent',
         attention_mask: torch.Tensor | None = None,
         use_cache: bool | None = True,
@@ -144,6 +145,10 @@ class KimiDeltaAttention(nn.Module):
             beta = beta.sigmoid() * 2.0
         else:
             beta = beta.sigmoid()
+
+        if recurrent_state is None:
+            recurrent_state = self.cache_states[:batch_size]
+        assert batch_size == recurrent_state.size(0)
 
         if mode == "chunk":
             o, recurrent_state = chunk_kda(
@@ -180,4 +185,4 @@ class KimiDeltaAttention(nn.Module):
         o = rearrange(o, "b t h d -> b t (h d)")
         o = o @ self.o_proj.weight.t()  # bhk,mhk->bm
 
-        return o, recurrent_state
+        return o, recurrent_state, _
