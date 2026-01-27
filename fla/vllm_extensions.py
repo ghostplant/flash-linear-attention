@@ -148,3 +148,39 @@ void main() {
       return map_array_1d, attn_metadata
     else:
       return [], None
+
+def paged_kda_forward(kda, x, metadata):
+    map_tensor, attn_metadata = metadata
+    assert x.dim() == 2
+    o = torch.empty_like(x)
+    if attn_metadata is not None:
+        index_map_ptr = iter(map_tensor)
+        if attn_metadata.num_decodes > 0:
+            map_ptr = next(index_map_ptr)
+            # cache_states = kda.cache_states.index_select(0, map_ptr)
+            kda_output, _, _ = kda(
+                  x[:map_ptr.size(0)].unsqueeze(1),
+                  attention_mask=None,
+                  past_key_value=None,
+                  use_cache=False,
+                  output_attentions=False,
+            )
+            o[:map_ptr.size(0)].copy_(kda_output.flatten(0, 1))
+        if attn_metadata.num_prefills > 0:
+            for chunk in attn_metadata.prefill.chunks:
+              map_ptr = next(index_map_ptr)
+              assert map_ptr.numel() == 1
+              # cache_states = kda.cache_states.index_select(0, map_ptr)
+              kda_output, _, _ = kda(
+                  x[chunk.token_start:chunk.token_end].unsqueeze(0),
+                  attention_mask=None,
+                  past_key_value=None,
+                  use_cache=False,
+                  output_attentions=False,
+              )
+              o[chunk.token_start:chunk.token_end].copy_(kda_output.flatten(0, 1))
+    else:
+        o.fill_(-1)
+    return o
+
+
