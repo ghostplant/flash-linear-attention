@@ -146,9 +146,8 @@ class KimiDeltaAttention(nn.Module):
         else:
             beta = beta.sigmoid()
 
-        if recurrent_state is None:
+        if recurrent_state is None and self.cache_states.size(0) >= batch_size:
             recurrent_state = self.cache_states[:batch_size]
-        assert batch_size == recurrent_state.size(0)
 
         if mode == "chunk":
             o, recurrent_state = chunk_kda(
