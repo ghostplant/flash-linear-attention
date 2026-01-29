@@ -71,13 +71,21 @@ except:
   raise Exception('Failed to import autort, please install:\npython3 -m pip install --no-build-isolation https://github.com/microsoft/antares/releases/download/v0.9.6/autort-0.9.6.4.5+cuda.zip')
 
 @torch.compiler.disable(recursive=True)
-def get_inflight_index_map(positions, buffer_count=32):
+def get_inflight_index_map(positions, buffer_count=32, init_hook=None):
   forward_context = get_forward_context()
   if not hasattr(get_inflight_index_map, 'inflight_table_map'):
-    inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=positions.device)
+    device = positions.device
+    os.environ['LOCAL_RANK'] = str(device.index)
+    os.environ['RANK'] = str(torch.distributed.get_rank())
+    os.environ['SIZE'] = str(torch.distributed.get_world_size())
+    torch._dynamo.config.recompile_limit = 4096
+
+    if init_hook is not None:
+      init_hook(device)
+    inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=device)
     inflight_table_map[0] = 0
     get_inflight_index_map.inflight_table_map = inflight_table_map
-    get_inflight_index_map.inflight_map_fn = torch.compiler.disable(autort.export(name=f'inflight_map_fn', dev=positions.device.index, source=r'''
+    get_inflight_index_map.inflight_map_fn = torch.compiler.disable(autort.export(name=f'inflight_map_fn', dev=device.index, source=r'''
 @DEF_FUNC: query_start_loc:int32[N], positions:int64[P], block_table:int32[N, L], inflight_table_map:int32[NUMBLOCKS] -> current_map:int32[N]
 @DEF_BIND: ~%~:1
 @DEF_EXTRA: world_rank:int32, buffer_count:int32
