@@ -191,4 +191,17 @@ def paged_kda_forward(kda, x, metadata):
         o.fill_(-1)
     return o
 
+def kda_layer(config, buffer_count=32):
+    from fla.layers.kda import KimiDeltaAttention
+    return KimiDeltaAttention(
+      hidden_size=getattr(config, 'hidden_size', 7168),
+      num_heads=getattr(config, 'num_attention_heads', 128),
+      head_dim=getattr(config, 'kda_head_dim', 256),
+      expand_v=getattr(config, 'kda_expand_v', 2),
+      use_short_conv=getattr(config, 'kda_use_short_conv', False),
+      conv_size=getattr(config, 'kda_conv_size', 4),
+      conv_bias=getattr(config, 'kda_conv_bias', False),
+      norm_eps=getattr(config, 'rms_norm_eps', 1e-06),
+      buffer_count=buffer_count
+    )
 
