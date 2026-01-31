@@ -11,7 +11,7 @@ with open('README.md') as f:
 
 
 def get_package_version():
-    init_file = Path(os.path.dirname(os.path.abspath(__file__))) / 'fla' / '__init__.py'
+    init_file = Path(os.path.dirname(os.path.abspath(__file__))) / 'fla2' / '__init__.py'
     with open(init_file) as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     if version_match is None:
@@ -20,7 +20,7 @@ def get_package_version():
 
 
 setup(
-    name='flash-linear-attention',
+    name='flash-linear-attention2',
     version=get_package_version(),
     description='Fast Triton-based implementations of causal linear attention',
     long_description=long_description,
