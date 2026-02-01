@@ -65,15 +65,116 @@ if current_platform.is_cuda_alike():
 elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
 
-try:
-  import autort, os, random
-except:
-  raise Exception('Failed to import autort, please install:\npython3 -m pip install --no-build-isolation https://github.com/microsoft/antares/releases/download/v0.9.6/autort-0.9.6.4.5+cuda.zip')
+import autort, os, random
+
+def init_kda_fn(device, kda_path, buffer_count):
+  import os
+  from safetensors.torch import safe_open
+  import vllm.distributed
+  world_size = vllm.distributed.get_tp_group().world_size
+  world_rank = vllm.distributed.get_tp_group().rank_in_group
+
+  def from_float8_blockwise(w, ws, block_size=128, dtype=torch.bfloat16):
+    shape = w.shape
+    assert w.dtype == torch.float8_e4m3fn
+    assert w.dim() == ws.dim() and w.dim() in (2, 3)
+    if w.dim() == 2:
+      w, ws = w.unsqueeze(0), ws.unsqueeze(0)
+    else:
+      assert w.size(0) == ws.size(0)
+    ph = torch.empty([ws.size(0), ws.size(1) * block_size, ws.size(2) * block_size], dtype=w.dtype, device=w.device)
+    ph[:, :w.size(1), :w.size(2)] = w
+    ph = (ph.view(w.size(0), ws.size(1), block_size, ws.size(2), block_size).to(ws.dtype) * ws.view(w.size(0), ws.size(1), 1, ws.size(2), 1)).view(ph.shape)
+    return ph[:, :w.size(1), :w.size(2)].to(dtype).view(shape)
+
+  def load_tensor_fp8(f, key, device='cuda', fp8_to_bf16=False):
+    w = f.get_tensor(key).to(device)
+    try:
+      w.scale_inv = f.get_tensor(key + '_scale_inv').float().to(device)
+    except:
+      pass
+    if fp8_to_bf16 and w.dtype == torch.float8_e4m3fn:
+      w = from_float8_blockwise(w, w.scale_inv)
+    return w
+
+  def world_slice(t, dim=0):
+    if t is None or dim is None:
+      return t
+    assert t.size(dim) % world_size == 0, f'Failed during slicing tensor of shape {list(t.shape)} to {world_size} pieces at dim-{dim}.'
+    group_size = t.size(dim) // world_size
+    out = t.narrow(dim, world_rank * group_size, group_size).contiguous()
+    if hasattr(t, 'scale_inv'):
+      assert t.scale_inv.size(dim) % world_size == 0
+      group_size = t.scale_inv.size(dim) // world_size
+      out.scale_inv = t.scale_inv.narrow(dim, world_rank * group_size, group_size).contiguous()
+    return out
+
+  with safe_open(kda_path, framework='pt') as f:
+    param = {}
+    for k in f.keys():
+      if '.kda.' not in k:
+        continue
+      if k.endswith('_scale_inv'):
+        continue
+      if '.kda.k_proj.' in k or '.kda.v_proj.' in k or '_a_proj.weight' in k:
+        continue
+      if '.kda.q_proj.' in k:
+        k_new = k.replace('q_', 'fused_')
+        param[k_new] = torch.cat([
+          world_slice(load_tensor_fp8(f, k, 'cpu', fp8_to_bf16=True), dim=0),
+          world_slice(load_tensor_fp8(f, k.replace('q_', 'k_'), 'cpu', fp8_to_bf16=True), dim=0),
+          world_slice(load_tensor_fp8(f, k.replace('q_', 'v_'), 'cpu', fp8_to_bf16=True), dim=0),
+          load_tensor_fp8(f, k.replace('q_', 'f_a_'), 'cpu', fp8_to_bf16=True),
+          load_tensor_fp8(f, k.replace('q_', 'g_a_'), 'cpu', fp8_to_bf16=True),
+        ]).to(device)
+        continue
+      if '.kda.o_proj.' in k:
+        param[k] = world_slice(load_tensor_fp8(f, k, 'cpu', fp8_to_bf16=True), dim=1).to(device)
+        continue
+      if '.kda.o_norm.' in k:
+        param[k] = load_tensor_fp8(f, k, 'cpu', fp8_to_bf16=True).to(device)
+        continue
+      param[k] = world_slice(load_tensor_fp8(f, k, 'cpu', fp8_to_bf16=True), dim=0).to(device)
+
+    from fla2.modules import FusedRMSNormGated, ShortConvolution
+    from fla2.ops.kda import fused_recurrent_kda
+    from fla2.ops.kda.gate import fused_kda_gate
+    n_layers, total_layers, num_heads, head_k_dim, head_v_dim, norm_eps = 6, 61, 128 // world_size, 256, 512, 1e-06
+    key_dim, value_dim, conv_size = num_heads * head_k_dim, num_heads * head_v_dim, 4
+
+    with torch.no_grad():
+      kda_o_norm = [FusedRMSNormGated(head_v_dim, activation="sigmoid", eps=norm_eps).to(device) for i in range(n_layers)]
+      for l in range(n_layers):
+        kda_o_norm[l].weight.data.copy_(param.get(f'model.layers.{total_layers - n_layers + l}.kda.o_norm.weight', kda_o_norm[l].weight))
+
+    '''
+    q_conv1d = [ShortConvolution(hidden_size=key_dim, kernel_size=conv_size, bias=False, activation="silu").to(device) for i in range(n_layers)]
+    k_conv1d = [ShortConvolution(hidden_size=key_dim, kernel_size=conv_size, bias=False, activation="silu").to(device) for i in range(n_layers)]
+    v_conv1d = [ShortConvolution(hidden_size=value_dim, kernel_size=conv_size, bias=False, activation="silu").to(device) for i in range(n_layers)]
+    for l in range(n_layers):
+      q_conv1d[l].weight.data.copy_(param.get(f'model.layers.{l}.kda.q_conv1d.weight', q_conv1d[l].weight))
+      k_conv1d[l].weight.data.copy_(param.get(f'model.layers.{l}.kda.k_conv1d.weight', k_conv1d[l].weight))
+      v_conv1d[l].weight.data.copy_(param.get(f'model.layers.{l}.kda.v_conv1d.weight', v_conv1d[l].weight))
+    conv1d_state = torch.empty([n_layers, max_concurrency, 2 + value_dim // key_dim, key_dim, conv_size], dtype=torch.bfloat16, device=device)
+
+    if conv1d_state is not None:
+      conv1d_state[:, v.constant].zero_()
+
+    q = q_conv1d[l](hidden_states @ param[f'model.layers.{l}.kda.q_proj.weight'].t(),
+      cache=conv1d_state[l, 0] if conv1d_state is not None else None, output_final_state=conv1d_state is not None)[0]
+    k = k_conv1d[l](hidden_states @ param[f'model.layers.{l}.kda.k_proj.weight'].t(),
+      cache=conv1d_state[l, 1] if conv1d_state is not None else None, output_final_state=conv1d_state is not None)[0]
+    v = v_conv1d[l](hidden_states @ param[f'model.layers.{l}.kda.v_proj.weight'].t(),
+      cache=conv1d_state[l, 2:].flatten(0, 1) if conv1d_state is not None else None, output_final_state=conv1d_state is not None)[0]
+    '''
+  recurrent_state = torch.zeros([n_layers, buffer_count, num_heads, head_k_dim, head_v_dim], dtype=torch.float32, device=device)
+  return param, kda_o_norm, recurrent_state, n_layers, total_layers
+
 
 @torch.compiler.disable(recursive=True)
-def get_inflight_index_map(positions, buffer_count=32, init_hook=None):
+def prepare_inflight_index_map(self, positions, kda_path, buffer_count=32, init_hook=None):
   forward_context = get_forward_context()
-  if not hasattr(get_inflight_index_map, 'inflight_table_map'):
+  if not hasattr(prepare_inflight_index_map, 'inflight_table_map'):
     device = positions.device
     os.environ['LOCAL_RANK'] = str(device.index)
     os.environ['RANK'] = str(torch.distributed.get_rank())
@@ -82,10 +183,12 @@ def get_inflight_index_map(positions, buffer_count=32, init_hook=None):
 
     if init_hook is not None:
       init_hook(device)
+    self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
+
     inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=device)
     inflight_table_map[0] = 0
-    get_inflight_index_map.inflight_table_map = inflight_table_map
-    get_inflight_index_map.inflight_map_fn = torch.compiler.disable(autort.export(name=f'inflight_map_fn', dev=device.index, source=r'''
+    prepare_inflight_index_map.inflight_table_map = inflight_table_map
+    prepare_inflight_index_map.inflight_map_fn = torch.compiler.disable(autort.export(name=f'inflight_map_fn', dev=device.index, source=r'''
 @DEF_FUNC: query_start_loc:int32[N], positions:int64[P], block_table:int32[N, L], inflight_table_map:int32[NUMBLOCKS] -> current_map:int32[N]
 @DEF_BIND: ~%~:1
 @DEF_EXTRA: world_rank:int32, buffer_count:int32
@@ -124,10 +227,10 @@ void main() {
 }'''))
 
   else:
-    inflight_table_map = get_inflight_index_map.inflight_table_map
+    inflight_table_map = prepare_inflight_index_map.inflight_table_map
 
   if forward_context.attn_metadata is None:
-    return [], None
+    return None
   else:
     attn_metadata = forward_context.attn_metadata.get('model.layers.0.self_attn.indexer.k_cache', None)
     if attn_metadata is not None:
@@ -141,7 +244,7 @@ void main() {
         req_offset += attn_metadata.num_decodes
         block_table = attn_metadata.decode.block_table
         assert block_table.size(0) == attn_metadata.num_decodes
-        map_array_1d.append(get_inflight_index_map.inflight_map_fn(query_start_loc[:req_offset],
+        map_array_1d.append(prepare_inflight_index_map.inflight_map_fn(query_start_loc[:req_offset],
           positions, block_table, inflight_table_map, extra=[world_rank, buffer_count]))
 
       if attn_metadata.num_prefills > 0:
@@ -149,13 +252,15 @@ void main() {
           block_table = chunk.block_table
           for i in range(block_table.size(0)):
             req_offset += 1
-            map_array_1d.append(get_inflight_index_map.inflight_map_fn(query_start_loc[req_offset - 1:req_offset],
+            map_array_1d.append(prepare_inflight_index_map.inflight_map_fn(query_start_loc[req_offset - 1:req_offset],
               positions, block_table[i:i + 1], inflight_table_map, extra=[world_rank, buffer_count]))
 
       assert attn_metadata.num_prefills + attn_metadata.num_decodes == req_offset
-      return map_array_1d, attn_metadata
+      self.kda_attn_metadata = attn_metadata
+      self.kda_map_array_1d = map_array_1d
+      return self
     else:
-      return [], None
+      return None
 
 def paged_kda_forward(kda, x, metadata):
     map_tensor, attn_metadata = metadata
@@ -204,4 +309,75 @@ def kda_layer(config, buffer_count=32):
       norm_eps=getattr(config, 'rms_norm_eps', 1e-06),
       buffer_count=buffer_count
     )
+
+
+def paged_kda_attn(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_idx: int,
+    state_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # Safely call triton/fla/autort/custom ops within non-fake version, e.g.:
+    assert hasattr(paged_kda_attn, 'kda_tp_param')
+    if not hasattr(paged_kda_attn, 'kda_attn_metadata'):
+      return hidden_states.clone()
+    param, l = paged_kda_attn.kda_tp_param, layer_idx
+    hidden_states_shape = hidden_states.shape
+
+    kda_A_log = param.get(f'model.layers.{l}.kda.A_log', None)
+    if kda_A_log is None:
+      return hidden_states
+
+    from fla2.modules import FusedRMSNormGated, ShortConvolution
+    from fla2.ops.kda import fused_recurrent_kda
+    from fla2.ops.kda.gate import fused_kda_gate
+    world_size = get_tensor_model_parallel_world_size()
+    num_heads, head_k_dim, head_v_dim, norm_eps = 128 // world_size, 256, 512, 1e-06
+    key_dim, value_dim, conv_size = num_heads * head_k_dim, num_heads * head_v_dim, 4
+
+    hidden_states = hidden_states.view(1, -1, hidden_states.size(-1))
+    assert hidden_states.dim() == 3
+    qkvfg = hidden_states @ param[f'model.layers.{l}.kda.fused_proj.weight'].t()
+    qkv_dim = num_heads * (head_k_dim + head_k_dim + head_v_dim)
+    fg_a_dim = (qkvfg.size(-1) - qkv_dim) // 2
+    qkv = torch.nn.functional.silu(qkvfg.narrow(-1, 0, qkv_dim)).view(*qkvfg.shape[:-1], num_heads, -1) # bm,hkm->bhk
+
+    beta = (hidden_states @ param[f'model.layers.{l}.kda.b_proj.weight'].t()) # .sigmoid()  # bs,hs->bh
+    g = (qkvfg.narrow(-1, qkv_dim, fg_a_dim) @ param[f'model.layers.{l}.kda.f_b_proj.weight'].t()) # bs,lm->bl |  bl,hkl->bhk
+
+    layer_offset = l - (paged_kda_attn.total_layers - paged_kda_attn.n_layers)
+    state = paged_kda_attn.recurrent_state[layer_offset][:hidden_states.size(0)]
+    g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias'])
+    o, _ = fused_recurrent_kda(
+                q=qkv.narrow(-1, 0, head_k_dim),
+                k=qkv.narrow(-1, head_k_dim, head_k_dim),
+                v=qkv.narrow(-1, head_k_dim * 2, head_v_dim),
+                g=g,
+                beta=beta,
+                initial_state=state, # B,H,K,V
+                use_qk_l2norm_in_kernel=True)
+
+    f = torch.addmm(param[f'model.layers.{l}.kda.g_b_proj.bias'].view(1, -1), qkvfg.view(-1, qkvfg.size(-1))
+            .narrow(-1, qkv_dim + fg_a_dim, fg_a_dim), param[f'model.layers.{l}.kda.g_b_proj.weight'].t())
+    o = paged_kda_attn.kda_o_norm[layer_offset](o, f.view(*qkvfg.shape[:-1], num_heads, -1))
+    o = o.flatten(-2) @ param[f'model.layers.{l}.kda.o_proj.weight'].t()  # bhk,mhk->bm
+    return o.view(hidden_states_shape)
+
+
+# using registered fake `torch.ops.vllm.custom_fn` to hide torch.compile.disable failure
+def paged_kda_attn_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_idx: int,
+    state_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+direct_register_custom_op(
+    op_name="paged_kda_attn",
+    op_func=paged_kda_attn,
+    mutates_args=[],
+    fake_impl=paged_kda_attn_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
