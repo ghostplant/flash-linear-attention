@@ -172,7 +172,8 @@ def init_kda_fn(device, kda_path, buffer_count):
 
 
 @torch.compiler.disable(recursive=True)
-def prepare_inflight_index_map(self, positions, kda_path, buffer_count=32, init_hook=None):
+def prepare_inflight_index_map(positions, kda_path, buffer_count=32, init_hook=None):
+  from fla2.vllm_extensions import fla2_paged_kda_attn as self
   forward_context = get_forward_context()
   if not hasattr(prepare_inflight_index_map, 'inflight_table_map'):
     device = positions.device
@@ -183,7 +184,9 @@ def prepare_inflight_index_map(self, positions, kda_path, buffer_count=32, init_
 
     if init_hook is not None:
       init_hook(device)
-    self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
+    kda_path = kda_path.strip()
+    if kda_path:
+      self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
 
     inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=device)
     inflight_table_map[0] = 0
@@ -210,13 +213,13 @@ void main() {
       int prev_addr = LEADING_BLOCK_ID(n);
       LEADING_BLOCK_ID(n) = curr_addr;
       if (world_rank == 0)
-        printf("[Inflight-Batch-Logging] New Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d register to new cache_idx-%d (previous-idx:%d)\n",
+        printf("[Inflight-Batch-Prefill] New Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d register to new cache_idx-%d (previous-idx:%d)\n",
           world_rank, n, int(size_of_N()), left, right, n, curr_addr, prev_addr);
     } else {
       // non-leading-prefill or decode query mapping
       if (world_rank == 0) {
         if (left + 1 < right)
-          printf("[Inflight-Batch-Logging] Old Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d should use cache_idx-%d\n",
+          printf("[Inflight-Batch-Prefill] Old Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d should use cache_idx-%d\n",
             world_rank, n, int(size_of_N()), left, right, n, LEADING_BLOCK_ID(n));
         if (LEADING_BLOCK_ID(n) < 0)
           printf("  [error found] inflight batching has no mapping index.\n");
@@ -311,17 +314,18 @@ def kda_layer(config, buffer_count=32):
     )
 
 
-def paged_kda_attn(
+def fla2_paged_kda_attn(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     layer_idx: int,
     state_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Safely call triton/fla/autort/custom ops within non-fake version, e.g.:
-    assert hasattr(paged_kda_attn, 'kda_tp_param')
-    if not hasattr(paged_kda_attn, 'kda_attn_metadata'):
-      return hidden_states.clone()
-    param, l = paged_kda_attn.kda_tp_param, layer_idx
+    if not hasattr(fla2_paged_kda_attn, 'kda_attn_metadata'):
+      return hidden_states
+    if not hasattr(fla2_paged_kda_attn, 'kda_tp_param'):
+      return hidden_states
+    param, l = fla2_paged_kda_attn.kda_tp_param, layer_idx
     hidden_states_shape = hidden_states.shape
 
     kda_A_log = param.get(f'model.layers.{l}.kda.A_log', None)
@@ -345,8 +349,8 @@ def paged_kda_attn(
     beta = (hidden_states @ param[f'model.layers.{l}.kda.b_proj.weight'].t()) # .sigmoid()  # bs,hs->bh
     g = (qkvfg.narrow(-1, qkv_dim, fg_a_dim) @ param[f'model.layers.{l}.kda.f_b_proj.weight'].t()) # bs,lm->bl |  bl,hkl->bhk
 
-    layer_offset = l - (paged_kda_attn.total_layers - paged_kda_attn.n_layers)
-    state = paged_kda_attn.recurrent_state[layer_offset][:hidden_states.size(0)]
+    layer_offset = l - (fla2_paged_kda_attn.total_layers - fla2_paged_kda_attn.n_layers)
+    state = fla2_paged_kda_attn.recurrent_state[layer_offset][:hidden_states.size(0)]
     g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias'])
     o, _ = fused_recurrent_kda(
                 q=qkv.narrow(-1, 0, head_k_dim),
@@ -359,13 +363,16 @@ def paged_kda_attn(
 
     f = torch.addmm(param[f'model.layers.{l}.kda.g_b_proj.bias'].view(1, -1), qkvfg.view(-1, qkvfg.size(-1))
             .narrow(-1, qkv_dim + fg_a_dim, fg_a_dim), param[f'model.layers.{l}.kda.g_b_proj.weight'].t())
-    o = paged_kda_attn.kda_o_norm[layer_offset](o, f.view(*qkvfg.shape[:-1], num_heads, -1))
+    o = fla2_paged_kda_attn.kda_o_norm[layer_offset](o, f.view(*qkvfg.shape[:-1], num_heads, -1))
     o = o.flatten(-2) @ param[f'model.layers.{l}.kda.o_proj.weight'].t()  # bhk,mhk->bm
+
+    import vllm.distributed
+    vllm.distributed.get_tp_group().all_reduce(o)
     return o.view(hidden_states_shape)
 
 
 # using registered fake `torch.ops.vllm.custom_fn` to hide torch.compile.disable failure
-def paged_kda_attn_fake(
+def fla2_paged_kda_attn_fake(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     layer_idx: int,
@@ -374,10 +381,10 @@ def paged_kda_attn_fake(
     return torch.empty_like(hidden_states)
 
 direct_register_custom_op(
-    op_name="paged_kda_attn",
-    op_func=paged_kda_attn,
+    op_name="fla2_paged_kda_attn",
+    op_func=fla2_paged_kda_attn,
     mutates_args=[],
-    fake_impl=paged_kda_attn_fake,
+    fake_impl=fla2_paged_kda_attn_fake,
     dispatch_key=current_platform.dispatch_key,
 )
 
