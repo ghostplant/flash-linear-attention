@@ -202,12 +202,12 @@ void main() {
     if ((left == 0 && right == 1) || block_table(n, 0) < 0) { // warmup
       current_map(n) = 0; continue;
     }
-    // printf("debug[gpu-%d, sample-%d/%d]: positions=[%d .. %d)\n", world_rank, n, int(size_of_N()), left, right); continue;
+    // if (world_rank == 0) printf("debug[gpu-%d, sample-%d/%d]: positions=[%d .. %d)\n", world_rank, n, int(size_of_N()), left, right); // continue;
 
 #define TABLE_COUNTER()      (inflight_table_map(0))
 #define LEADING_BLOCK_ID(n)  inflight_table_map(block_table(n, 0) + 1)
 
-    if (left == 0) {
+    if (left == 0 || right <= 2) {
       // prefill update mapping
       int curr_addr = atomicAdd(&TABLE_COUNTER(), 1) % buffer_count;
       int prev_addr = LEADING_BLOCK_ID(n);
@@ -313,17 +313,16 @@ def kda_layer(config, buffer_count=32):
       buffer_count=buffer_count
     )
 
+def has_kda_layer(layer_idx: int) -> bool:
+    return layer_idx >= (61 - 6)
 
 def fla2_paged_kda_attn(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     layer_idx: int,
-    state_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Safely call triton/fla/autort/custom ops within non-fake version, e.g.:
-    if not hasattr(fla2_paged_kda_attn, 'kda_attn_metadata'):
-      return hidden_states
-    if not hasattr(fla2_paged_kda_attn, 'kda_tp_param'):
+    if not hasattr(fla2_paged_kda_attn, 'kda_attn_metadata') or not hasattr(fla2_paged_kda_attn, 'kda_tp_param'):
       return hidden_states
     param, l = fla2_paged_kda_attn.kda_tp_param, layer_idx
     hidden_states_shape = hidden_states.shape
@@ -350,17 +349,36 @@ def fla2_paged_kda_attn(
     g = (qkvfg.narrow(-1, qkv_dim, fg_a_dim) @ param[f'model.layers.{l}.kda.f_b_proj.weight'].t()) # bs,lm->bl |  bl,hkl->bhk
 
     layer_offset = l - (fla2_paged_kda_attn.total_layers - fla2_paged_kda_attn.n_layers)
-    state = fla2_paged_kda_attn.recurrent_state[layer_offset][:hidden_states.size(0)]
-    g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias'])
-    o, _ = fused_recurrent_kda(
-                q=qkv.narrow(-1, 0, head_k_dim),
-                k=qkv.narrow(-1, head_k_dim, head_k_dim),
-                v=qkv.narrow(-1, head_k_dim * 2, head_v_dim),
-                g=g,
-                beta=beta,
-                initial_state=state, # B,H,K,V
-                use_qk_l2norm_in_kernel=True)
+    g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias']).flatten(0, 1)
 
+    index_map = iter(fla2_paged_kda_attn.kda_map_array_1d)
+    o = torch.zeros([qkv.size(0) * qkv.size(1), num_heads, head_v_dim], dtype=qkv.dtype, device=qkv.device)
+    if fla2_paged_kda_attn.kda_attn_metadata.num_decodes > 0:
+        QKV = qkv.view(o.size(0), 1, num_heads, qkv.size(-1))[:fla2_paged_kda_attn.kda_attn_metadata.num_decodes]
+        state = fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_() if fla2_paged_kda_attn.recurrent_state[layer_offset].size(0) >= QKV.size(0) else None
+        o[:QKV.size(0)].copy_(fused_recurrent_kda(
+                q=QKV.narrow(-1, 0, head_k_dim),
+                k=QKV.narrow(-1, head_k_dim, head_k_dim),
+                v=QKV.narrow(-1, head_k_dim * 2, head_v_dim),
+                g=g[:QKV.size(0)],
+                beta=beta[:QKV.size(0)],
+                initial_state=state, # B,H,K,V
+                use_qk_l2norm_in_kernel=True)[0].flatten(0, 1))
+
+    if fla2_paged_kda_attn.kda_attn_metadata.num_prefills > 0:
+        for chunk in fla2_paged_kda_attn.kda_attn_metadata.prefill.chunks:
+            QKV = qkv.view(1, -1, num_heads, qkv.size(-1))[:, chunk.token_start : chunk.token_end]
+            state = fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_()
+            o[chunk.token_start : chunk.token_end].copy_(fused_recurrent_kda(
+                q=QKV.narrow(-1, 0, head_k_dim),
+                k=QKV.narrow(-1, head_k_dim, head_k_dim),
+                v=QKV.narrow(-1, head_k_dim * 2, head_v_dim),
+                g=g[:, chunk.token_start : chunk.token_end],
+                beta=beta[:, chunk.token_start : chunk.token_end],
+                initial_state=state, # B,H,K,V
+                use_qk_l2norm_in_kernel=True)[0].flatten(0, 1))
+
+    o = o.unsqueeze(0)
     f = torch.addmm(param[f'model.layers.{l}.kda.g_b_proj.bias'].view(1, -1), qkvfg.view(-1, qkvfg.size(-1))
             .narrow(-1, qkv_dim + fg_a_dim, fg_a_dim), param[f'model.layers.{l}.kda.g_b_proj.weight'].t())
     o = fla2_paged_kda_attn.kda_o_norm[layer_offset](o, f.view(*qkvfg.shape[:-1], num_heads, -1))
@@ -368,17 +386,16 @@ def fla2_paged_kda_attn(
 
     import vllm.distributed
     vllm.distributed.get_tp_group().all_reduce(o)
+    # autort.ops.device_print_int(o.sum().flatten().to(torch.int32))
     return o.view(hidden_states_shape)
-
 
 # using registered fake `torch.ops.vllm.custom_fn` to hide torch.compile.disable failure
 def fla2_paged_kda_attn_fake(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     layer_idx: int,
-    state_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    return hidden_states
 
 direct_register_custom_op(
     op_name="fla2_paged_kda_attn",

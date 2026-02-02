@@ -403,7 +403,7 @@ def fused_recurrent_kda(
         dt_bias=dt_bias,
         scale=scale,
         initial_state=initial_state,
-        inplace_final_state=True,
+        inplace_final_state=initial_state is not None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
