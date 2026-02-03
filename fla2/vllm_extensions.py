@@ -187,6 +187,8 @@ def prepare_inflight_index_map(positions, kda_path, buffer_count=32, init_hook=N
     kda_path = kda_path.strip()
     if kda_path:
       self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
+    else:
+      self.kda_tp_param = {}
 
     inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=device)
     inflight_table_map[0] = 0
@@ -313,8 +315,10 @@ def kda_layer(config, buffer_count=32):
       buffer_count=buffer_count
     )
 
-def has_kda_layer(layer_idx: int) -> bool:
-    return layer_idx >= (61 - 6)
+def fla2_has_kda_layer(positions: torch.Tensor, layer_idx: int) -> bool:
+    has_layer = layer_idx >= 55
+    # has_layer = getattr(fla2_paged_kda_attn, 'kda_tp_param', {}).get(f'model.layers.{layer_idx}.kda.A_log', None) is not None
+    return has_layer
 
 def fla2_paged_kda_attn(
     hidden_states: torch.Tensor,
@@ -323,13 +327,13 @@ def fla2_paged_kda_attn(
 ) -> torch.Tensor:
     # Safely call triton/fla/autort/custom ops within non-fake version, e.g.:
     if not hasattr(fla2_paged_kda_attn, 'kda_attn_metadata') or not hasattr(fla2_paged_kda_attn, 'kda_tp_param'):
-      return hidden_states
+      return torch.zeros_like(hidden_states)
     param, l = fla2_paged_kda_attn.kda_tp_param, layer_idx
     hidden_states_shape = hidden_states.shape
 
     kda_A_log = param.get(f'model.layers.{l}.kda.A_log', None)
     if kda_A_log is None:
-      return hidden_states
+      return torch.zeros_like(hidden_states)
 
     from fla2.modules import FusedRMSNormGated, ShortConvolution
     from fla2.ops.kda import fused_recurrent_kda
@@ -386,7 +390,7 @@ def fla2_paged_kda_attn(
 
     import vllm.distributed
     vllm.distributed.get_tp_group().all_reduce(o)
-    # autort.ops.device_print_int(o.sum().flatten().to(torch.int32))
+    # autort.ops.device_print_int(o.sum().flatten().to(torch.int32), extra=[l])
     return o.view(hidden_states_shape)
 
 # using registered fake `torch.ops.vllm.custom_fn` to hide torch.compile.disable failure
