@@ -109,11 +109,14 @@ def init_kda_fn(device, kda_path, buffer_count):
       out.scale_inv = t.scale_inv.narrow(dim, world_rank * group_size, group_size).contiguous()
     return out
 
+  min_layer_idx = int(1e9)
   with safe_open(kda_path, framework='pt') as f:
     param = {}
     for k in f.keys():
       if '.kda.' not in k:
         continue
+      layer_idx = int(k.split('.')[2])
+      min_layer_idx = min(min_layer_idx, layer_idx)
       if k.endswith('_scale_inv'):
         continue
       if '.kda.k_proj.' in k or '.kda.v_proj.' in k or '_a_proj.weight' in k:
@@ -172,7 +175,7 @@ def init_kda_fn(device, kda_path, buffer_count):
 
 
 @torch.compiler.disable(recursive=True)
-def prepare_inflight_index_map(positions, kda_path, buffer_count=32, init_hook=None):
+def prepare_inflight_index_map(positions, buffer_count=32, init_hook=None):
   from fla2.vllm_extensions import fla2_paged_kda_attn as self
   forward_context = get_forward_context()
   if not hasattr(prepare_inflight_index_map, 'inflight_table_map'):
@@ -184,11 +187,9 @@ def prepare_inflight_index_map(positions, kda_path, buffer_count=32, init_hook=N
 
     if init_hook is not None:
       init_hook(device)
-    kda_path = kda_path.strip()
-    if kda_path:
-      self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
-    else:
-      self.kda_tp_param = {}
+    kda_path = os.environ['KDA_PATH'].strip()
+    assert kda_path is not None
+    self.kda_tp_param, self.kda_o_norm, self.recurrent_state, self.n_layers, self.total_layers = init_kda_fn(device, kda_path, buffer_count)
 
     inflight_table_map = torch.full([192000], -1, dtype=torch.int32, device=device)
     inflight_table_map[0] = 0
@@ -196,7 +197,7 @@ def prepare_inflight_index_map(positions, kda_path, buffer_count=32, init_hook=N
     prepare_inflight_index_map.inflight_map_fn = torch.compiler.disable(autort.export(name=f'inflight_map_fn', dev=device.index, source=r'''
 @DEF_FUNC: query_start_loc:int32[N], positions:int64[P], block_table:int32[N, L], inflight_table_map:int32[NUMBLOCKS] -> current_map:int32[N]
 @DEF_BIND: ~%~:1
-@DEF_EXTRA: world_rank:int32, buffer_count:int32
+@DEF_EXTRA: world_rank:int32, buffer_count:int32, has_kda:int32
 
 void main() {
   for (int n = 0; n < size_of_N(); ++n) {
@@ -215,14 +216,14 @@ void main() {
       int prev_addr = LEADING_BLOCK_ID(n);
       LEADING_BLOCK_ID(n) = curr_addr;
       if (world_rank == 0)
-        printf("[Inflight-Batch-Prefill] New Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d register to new cache_idx-%d (previous-idx:%d)\n",
-          world_rank, n, int(size_of_N()), left, right, n, curr_addr, prev_addr);
+        printf("[Inflight-Batch-Prefill (has_kda=%d)] New Request => [gpu-%d, sample-%d/%d]: fwd_pos=[%d .. %d), sample-%d register to new cache_idx-%d (previous-idx:%d)\n",
+          has_kda, world_rank, n, int(size_of_N()), left, right, n, curr_addr, prev_addr);
     } else {
       // non-leading-prefill or decode query mapping
       if (world_rank == 0) {
         if (left + 1 < right)
-          printf("[Inflight-Batch-Prefill] Old Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d should use cache_idx-%d\n",
-            world_rank, n, int(size_of_N()), left, right, n, LEADING_BLOCK_ID(n));
+          printf("[Inflight-Batch-Prefill (has_kda=%d)] Old Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d should use cache_idx-%d\n",
+            has_kda, world_rank, n, int(size_of_N()), left, right, n, LEADING_BLOCK_ID(n));
         if (LEADING_BLOCK_ID(n) < 0)
           printf("  [error found] inflight batching has no mapping index.\n");
       }
@@ -244,13 +245,13 @@ void main() {
 
       map_array_1d = []
       req_offset = 0
-      # NOTE: num_decodes IS BEFORE num_decodes in query_start_loc
+      has_kda = 1 if int(os.environ['KDA_LAYERS_AFTER']) < 61 else 0
       if attn_metadata.num_decodes > 0:
         req_offset += attn_metadata.num_decodes
         block_table = attn_metadata.decode.block_table
         assert block_table.size(0) == attn_metadata.num_decodes
         map_array_1d.append(prepare_inflight_index_map.inflight_map_fn(query_start_loc[:req_offset],
-          positions, block_table, inflight_table_map, extra=[world_rank, buffer_count]))
+          positions, block_table, inflight_table_map, extra=[world_rank, buffer_count, has_kda]))
 
       if attn_metadata.num_prefills > 0:
         for chunk in attn_metadata.prefill.chunks:
@@ -258,7 +259,7 @@ void main() {
           for i in range(block_table.size(0)):
             req_offset += 1
             map_array_1d.append(prepare_inflight_index_map.inflight_map_fn(query_start_loc[req_offset - 1:req_offset],
-              positions, block_table[i:i + 1], inflight_table_map, extra=[world_rank, buffer_count]))
+              positions, block_table[i:i + 1], inflight_table_map, extra=[world_rank, buffer_count, has_kda]))
 
       assert attn_metadata.num_prefills + attn_metadata.num_decodes == req_offset
       self.kda_attn_metadata = attn_metadata
@@ -267,39 +268,6 @@ void main() {
     else:
       return None
 
-def paged_kda_forward(kda, x, metadata):
-    map_tensor, attn_metadata = metadata
-    assert x.dim() == 2
-    o = torch.empty_like(x)
-    if attn_metadata is not None:
-        index_map_ptr = iter(map_tensor)
-        if attn_metadata.num_decodes > 0:
-            map_ptr = next(index_map_ptr)
-            # cache_states = kda.cache_states.index_select(0, map_ptr)
-            kda_output, _, _ = kda(
-                  x[:map_ptr.size(0)].unsqueeze(1),
-                  attention_mask=None,
-                  past_key_value=None,
-                  use_cache=False,
-                  output_attentions=False,
-            )
-            o[:map_ptr.size(0)].copy_(kda_output.flatten(0, 1))
-        if attn_metadata.num_prefills > 0:
-            for chunk in attn_metadata.prefill.chunks:
-              map_ptr = next(index_map_ptr)
-              assert map_ptr.numel() == 1
-              # cache_states = kda.cache_states.index_select(0, map_ptr)
-              kda_output, _, _ = kda(
-                  x[chunk.token_start:chunk.token_end].unsqueeze(0),
-                  attention_mask=None,
-                  past_key_value=None,
-                  use_cache=False,
-                  output_attentions=False,
-              )
-              o[chunk.token_start:chunk.token_end].copy_(kda_output.flatten(0, 1))
-    else:
-        o.fill_(-1)
-    return o
 
 def kda_layer(config, buffer_count=32):
     from fla2.layers.kda import KimiDeltaAttention
@@ -315,10 +283,19 @@ def kda_layer(config, buffer_count=32):
       buffer_count=buffer_count
     )
 
-def fla2_has_kda_layer(positions: torch.Tensor, layer_idx: int) -> bool:
-    has_layer = layer_idx >= 55
-    # has_layer = getattr(fla2_paged_kda_attn, 'kda_tp_param', {}).get(f'model.layers.{layer_idx}.kda.A_log', None) is not None
-    return has_layer
+def fla2_init() -> int:
+    kda_path = os.environ.get('KDA_PATH', '/proj-tango-pvc/kda.safetensors')
+    KDA_LAYERS_AFTER = int(1e9)
+    if kda_path.strip():
+      from safetensors.torch import safe_open
+      with safe_open(kda_path, framework='pt') as f:
+         for k in f.keys():
+             if '.kda.' in k and int(os.environ.get('USE_KDA', 1)) > 0:
+                 layer_idx = int(k.split('.')[2])
+                 KDA_LAYERS_AFTER = min(KDA_LAYERS_AFTER, layer_idx)
+    os.environ['KDA_LAYERS_AFTER'] = str(KDA_LAYERS_AFTER)
+    os.environ['KDA_PATH'] = kda_path
+    return int(KDA_LAYERS_AFTER)
 
 def fla2_paged_kda_attn(
     hidden_states: torch.Tensor,
@@ -353,32 +330,33 @@ def fla2_paged_kda_attn(
     g = (qkvfg.narrow(-1, qkv_dim, fg_a_dim) @ param[f'model.layers.{l}.kda.f_b_proj.weight'].t()) # bs,lm->bl |  bl,hkl->bhk
 
     layer_offset = l - (fla2_paged_kda_attn.total_layers - fla2_paged_kda_attn.n_layers)
-    g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias']).flatten(0, 1)
+    g = fused_kda_gate(g=g.view(*qkvfg.shape[:-1], num_heads, -1), A_log=kda_A_log, dt_bias=param[f'model.layers.{l}.kda.dt_bias'])
+    beta, g = beta.view(-1, beta.size(-1)), g.view(-1, g.size(-1))
 
     index_map = iter(fla2_paged_kda_attn.kda_map_array_1d)
     o = torch.zeros([qkv.size(0) * qkv.size(1), num_heads, head_v_dim], dtype=qkv.dtype, device=qkv.device)
     if fla2_paged_kda_attn.kda_attn_metadata.num_decodes > 0:
         QKV = qkv.view(o.size(0), 1, num_heads, qkv.size(-1))[:fla2_paged_kda_attn.kda_attn_metadata.num_decodes]
-        state = fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_() if fla2_paged_kda_attn.recurrent_state[layer_offset].size(0) >= QKV.size(0) else None
+        state = None # fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_() if fla2_paged_kda_attn.recurrent_state[layer_offset].size(0) >= QKV.size(0) else None
         o[:QKV.size(0)].copy_(fused_recurrent_kda(
                 q=QKV.narrow(-1, 0, head_k_dim),
                 k=QKV.narrow(-1, head_k_dim, head_k_dim),
                 v=QKV.narrow(-1, head_k_dim * 2, head_v_dim),
-                g=g[:QKV.size(0)],
-                beta=beta[:QKV.size(0)],
+                g=g[:QKV.size(0), None],
+                beta=beta[:QKV.size(0), None],
                 initial_state=state, # B,H,K,V
                 use_qk_l2norm_in_kernel=True)[0].flatten(0, 1))
 
     if fla2_paged_kda_attn.kda_attn_metadata.num_prefills > 0:
         for chunk in fla2_paged_kda_attn.kda_attn_metadata.prefill.chunks:
             QKV = qkv.view(1, -1, num_heads, qkv.size(-1))[:, chunk.token_start : chunk.token_end]
-            state = fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_()
+            state = None # fla2_paged_kda_attn.recurrent_state[layer_offset][:QKV.size(0)].zero_()
             o[chunk.token_start : chunk.token_end].copy_(fused_recurrent_kda(
                 q=QKV.narrow(-1, 0, head_k_dim),
                 k=QKV.narrow(-1, head_k_dim, head_k_dim),
                 v=QKV.narrow(-1, head_k_dim * 2, head_v_dim),
-                g=g[:, chunk.token_start : chunk.token_end],
-                beta=beta[:, chunk.token_start : chunk.token_end],
+                g=g[chunk.token_start : chunk.token_end].unsqueeze(0),
+                beta=beta[chunk.token_start : chunk.token_end].unsqueeze(0),
                 initial_state=state, # B,H,K,V
                 use_qk_l2norm_in_kernel=True)[0].flatten(0, 1))
 
