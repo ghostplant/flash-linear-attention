@@ -222,7 +222,7 @@ void main() {
       // non-leading-prefill or decode query mapping
       if (world_rank == 0) {
         if (left + 1 < right)
-          printf("[Inflight-Batch-Prefill (has_kda=%d)] Old Request => [gpu-%d, sample-%d/%d]: forwarding positions=[%d .. %d), sample-%d should use cache_idx-%d\n",
+          printf("[Inflight-Batch-Prefill (has_kda=%d)] Old Request => [gpu-%d, sample-%d/%d]: fwd_pos=[%d .. %d), sample-%d should use cache_idx-%d\n",
             has_kda, world_rank, n, int(size_of_N()), left, right, n, LEADING_BLOCK_ID(n));
         if (LEADING_BLOCK_ID(n) < 0)
           printf("  [error found] inflight batching has no mapping index.\n");
